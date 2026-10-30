@@ -4,10 +4,9 @@ import os
 import re
 import time
 import sqlite3
-from ast import literal_eval
 
 import hoshino
-from hoshino import aiorequests, priv
+from hoshino import aiorequests, priv, util
 from nonebot import on_command, get_bot, scheduler
 
 from .. import _pcr_data
@@ -35,58 +34,116 @@ FES_EXTRA_ROSTER_IDS = (1061, 1070, 1071)
 # 这些1星单位是活动赠送/剧情单位, 不属于普通白金扭蛋的常驻1星池
 NON_GACHA_1STAR_IDS = (1102, 1194, 1195, 1196, 1379)
 
-online_pcr_data_url = 'https://raw.githubusercontent.com/Ice-Cirno/LandosolRoster/master/_pcr_data.py'
+# 卡池选择优先级(越靠前越优先): 精选扭蛋是新角色池, 公主庆典其次, 白金扭蛋是常驻池
+BANNER_PRIORITY = ('精选扭蛋', '公主庆典', '白金扭蛋')
+# 付费必得池与自选附奖池不参与模拟
+BANNER_EXCLUDE = ('必得', '自选附奖')
+# gacha_data.pick_up_chara_text 中表示“无精选”的占位文本
+NO_PICKUP_TEXT = '没有精选角色'
+
+# 官方公示概率(千分制): 常规卡池★3为3%, 公主庆典期间★3出率提升为2倍(6%)
+S3_PROB_NORMAL = 30
+S3_PROB_FES = 60
+
+online_pcr_data_url = 'https://raw.githubusercontent.com/Ice-Cirno/LandosolRoster/master/chara_name.json'
 
 
-async def get_online_pcrdata():
+def _name_owner_map() -> dict:
+    '''归一化别名 -> 角色id, 用于保证合并后花名册无重名'''
+    return {util.normalize_str(n): cid
+            for cid, names in _pcr_data.CHARA_NAME.items()
+            for n in names}
+
+
+async def get_online_pcrdata() -> dict:
     '''
-    获取在线的角色数据信息, 并处理为json格式
+    获取在线的角色数据信息(chara_name.json), 返回 {id: [别名...]}
     '''
-    online_pcrdata = await aiorequests.get(url=online_pcr_data_url, timeout=10, verify=False)
-    if online_pcrdata.status_code != 200:
-        hoshino.logger.error(f'获取在线角色数据时发生错误{online_pcrdata.status_code}')
-        return {}
-
-    # 移除开头的'CHARA_NAME = ', 格式化为json便于处理
-    online_pcrdata_text = await online_pcrdata.text
-    # 处理兰德索尔花名册使其符合原先的gacha api数据
-    pattern = r"CHARA_NAME\s*=\s*\{[^}]*\}"
-    match = re.search(pattern, online_pcrdata_text)
     try:
-        online_pcrdata_text = match.group(0).replace('CHARA_NAME = ', '')
-    except:
-        hoshino.logger.error('处理在线角色数据发生错误')
+        rsp = await aiorequests.get(url=online_pcr_data_url, timeout=10, verify=False)
+        if rsp.status_code != 200:
+            hoshino.logger.error(f'获取在线角色数据时发生错误{rsp.status_code}')
+            return {}
+        data = json.loads(await rsp.text)
+        online = {}
+        for cid, names in data.items():
+            names = [str(n).strip() for n in names if str(n).strip()]
+            if names:
+                online[int(cid)] = names
+        return online
+    except Exception as e:
+        hoshino.logger.exception(f'解析在线角色数据失败: {repr(e)}')
         return {}
-    online_pcrdata_json = literal_eval(online_pcrdata_text)
-    return online_pcrdata_json
 
 
-async def update_pcrdata():
+async def update_pcrdata() -> int:
     '''
-    对比本地和远程的_pcr_data.py, 自动补充本地没有的角色信息, 已有角色信息不受影响
+    与远程花名册做并集合并, 返回本次新增的 id 与别名数量
+    - 新角色: 新增 id 并下载图标
+    - 已有角色: 补齐缺失别名; 显示名排序由 chara_name_fix.py 定时处理
+    - 归一化后与已有别名冲突的条目一律跳过, 保证花名册无重名
+    - 本地独有的角色/别名不会被删除
     '''
     online_pcrdata = await get_online_pcrdata()
+    if not online_pcrdata:
+        return -1
 
     hoshino.logger.info('开始对比角色数据')
-    if online_pcrdata == {}:
-        return -1
-    for id in online_pcrdata:
-        if id not in _pcr_data.CHARA_NAME and id != 9401:
-            hoshino.logger.info(f'已开始更新角色{id}的数据和图标')
-            # 由于返回数据可能出现全半角重复, 做一定程度的兼容性处理, 会将所有全角替换为半角, 并移除重复别称
-            for i, name in enumerate(online_pcrdata[id]):
-                name_format = name.replace('（', '(')
-                name_format = name_format.replace('）', ')')
-                online_pcrdata[id][i] = name_format
+    owner = _name_owner_map()
+    added_ids = added_names = 0
+    changed = False
 
-            # 转集合再转列表, 移除重复元素
-            online_pcrdata[id] = list(set(online_pcrdata[id]))
-            _pcr_data.chara_master.add_chara(id, online_pcrdata[id])
-            await download_chara_icon(id, 6)
-            await download_chara_icon(id, 3)
-            await download_chara_icon(id, 1)
+    for cid, names in online_pcrdata.items():
+        if cid == 9401:
+            continue
+
+        # 1) 新角色: 整条新增
+        if cid not in _pcr_data.CHARA_NAME:
+            picked = []
+            for n in names:
+                key = util.normalize_str(n)
+                if key in owner:
+                    continue
+                picked.append(n)
+                owner[key] = cid
+            if not picked:
+                n = f'{names[0]}({cid})'
+                picked = [n]
+                owner[util.normalize_str(n)] = cid
+            hoshino.logger.info(f'已开始更新角色{cid}的数据和图标')
+            _pcr_data.CHARA_NAME[cid] = picked
+            changed = True
+            added_ids += 1
+            for star in (6, 3, 1):
+                try:
+                    await download_chara_icon(cid, star)
+                except Exception as e:
+                    hoshino.logger.error(f'下载角色{cid} {star}星头像失败: {repr(e)}')
+            continue
+
+        cur = _pcr_data.CHARA_NAME[cid]
+
+        # 2) 已有角色: 补齐缺失别名
+        merged = list(cur)
+        seen = {util.normalize_str(n) for n in cur}
+        for n in names:
+            key = util.normalize_str(n)
+            if key in seen or (key in owner and owner[key] != cid):
+                continue
+            merged.append(n)
+            seen.add(key)
+            owner[key] = cid
+            added_names += 1
+        if len(merged) != len(cur):
+            _pcr_data.CHARA_NAME[cid] = merged
+            changed = True
+
+    if changed:
+        _pcr_data.chara_master.save_name()
     # 重载花名册(不会引起全局reload)
     roster.update()
+    hoshino.logger.info(f'角色数据同步完成: 新增id {added_ids}, 新增别名 {added_names}')
+    return added_ids + added_names
 
 
 def find_latest_autopcr_db() -> str:
@@ -138,10 +195,46 @@ def _ensure_unique_name(cid: int, base_name: str) -> str:
     return ''
 
 
+def _pickup_names(text: str) -> list:
+    '''拆解 gacha_data.pick_up_chara_text，返回当期精选角色名'''
+    return [n.strip() for n in re.split(r'[\n、，,／/]', text or '')
+            if n.strip() and n.strip() != NO_PICKUP_TEXT]
+
+
+def _canonical_name(name: str, ensure: bool = False) -> str:
+    '''把官方角色名映射为花名册中可唯一反查的别名'''
+    cid = roster.get_id(name)
+    if cid == UNKNOWN:
+        return ''
+    for alias in _pcr_data.CHARA_NAME.get(cid, ()):
+        if roster.get_id(alias) == cid:
+            return alias
+    return _ensure_unique_name(cid, name) if ensure else ''
+
+
+def _active_banners(con, now: tuple) -> list:
+    '''返回进行中、可用于模拟的卡池，按优先级与开始时间排序'''
+    rows = con.execute(
+        'SELECT gacha_id, gacha_name, exchange_id, start_time, end_time, pick_up_chara_text '
+        'FROM gacha_data WHERE gacha_id < 100000').fetchall()
+    active = [r for r in rows
+              if _parse_dbtime(r[3]) <= now < _parse_dbtime(r[4])
+              and not any(k in r[1] for k in BANNER_EXCLUDE)
+              and _pickup_names(r[5])]
+    priority = {key: len(BANNER_PRIORITY) - i for i, key in enumerate(BANNER_PRIORITY)}
+
+    def _rank(row):
+        # 同期多个精选池并存时取最新开启的那个(游戏内主推池), 同开始时间再按类型优先级
+        name = row[1]
+        score = next((v for k, v in priority.items() if k in name), 0)
+        return _parse_dbtime(row[3]), score
+    return sorted(active, key=_rank, reverse=True)
+
+
 def derive_pool_from_db(db_path: str) -> dict:
     '''
     从 autopcr 的国服 redive 库快照推导当前卡池数据
-    up:       当前白金扭蛋(国服常规UP池)的UP角色名列表
+    up:       当期主打卡池(精选/公主庆典/白金)的精选角色名列表
     fes_up:   公主庆典UP角色名列表
     star3/2/1: 普通白金扭蛋的常驻3/2/1星角色名列表
     '''
@@ -159,29 +252,26 @@ def derive_pool_from_db(db_path: str) -> dict:
     con = sqlite3.connect('file:' + db_path.replace('\\', '/') + '?mode=ro', uri=True)
     try:
         now = _parse_dbtime(time.strftime('%Y-%m-%d %H:%M:%S'))
-        banners = con.execute(
-            "SELECT gacha_id, exchange_id, start_time, end_time FROM gacha_data "
-            "WHERE gacha_name LIKE '%白金扭蛋%' AND gacha_id < 100000").fetchall()
-        active = [b for b in banners if _parse_dbtime(b[2]) <= now < _parse_dbtime(b[3])]
-        if not active:
-            raise ValueError('库快照中没有进行中的白金扭蛋')
-        gacha_id, exchange_id, _, _ = max(active, key=lambda b: _parse_dbtime(b[2]))
+        # 当期UP取自 gacha_data.pick_up_chara_text(官方精选角色), 不再用天井兑换列表:
+        # 兑换列表会把当期所有可兑换限定角色都算成UP, 单个角色出率被稀释到几百分之一
+        banner = _active_banners(con, now)
+        if not banner:
+            raise ValueError('库快照中没有带精选角色的进行中卡池')
+        banner = banner[0]
+        gacha_id, gacha_name, exchange_id, _, _, pickup_text = banner
 
-        up_rows = con.execute(
-            'SELECT DISTINCT l.unit_id, u.unit_name FROM gacha_exchange_lineup l '
-            'LEFT JOIN unit_data u ON u.unit_id = l.unit_id '
-            'WHERE l.exchange_id = ? AND l.rarity = 3',
-            (exchange_id,)).fetchall()
-        up = []
-        for u, db_name in up_rows:
-            name = unit2name(u, db_name, ensure=True)
-            if name:
-                if name not in up:
-                    up.append(name)
-            else:
-                hoshino.logger.warning(f'白金扭蛋UP角色 unit_id={u} 无法映射为角色名, 已跳过')
+        up, up_cids = [], set()
+        for name in _pickup_names(pickup_text):
+            canonical = _canonical_name(name, ensure=True)
+            if not canonical:
+                hoshino.logger.warning(f'{gacha_name}UP角色“{name}”无法映射到花名册, 已跳过')
+                continue
+            cid = roster.get_id(canonical)
+            if cid != UNKNOWN and cid not in up_cids:
+                up_cids.add(cid)
+                up.append(canonical)
         if not up:
-            raise ValueError(f'当前白金扭蛋(gacha_id={gacha_id})没有可用的UP角色')
+            raise ValueError(f'{gacha_name}(gacha_id={gacha_id})的UP角色无法映射为角色名')
 
         # FES(公主庆典)常驻限定角色: 花名册1800号段的公主/组合系列 + 初代三先驱
         fes_rows = con.execute(
@@ -226,6 +316,8 @@ def derive_pool_from_db(db_path: str) -> dict:
         return {
             'ver': ver,
             'gacha_id': gacha_id,
+            'banner_name': gacha_name,
+            's3_prob': S3_PROB_FES if '公主庆典' in gacha_name else S3_PROB_NORMAL,
             'up': up,
             'fes_up': fes_up,
             'star3': star3,
@@ -286,6 +378,8 @@ def update_local_pool(derived: dict) -> None:
     bl['up'] = list(derived['up'])
     if derived.get('gacha_id') is not None:
         bl['banner_id'] = str(derived['gacha_id'])
+    if derived.get('s3_prob'):
+        bl['s3_prob'] = derived['s3_prob']
     # 每次都用库快照重建常驻池, 不再做单向删除, 避免常驻角色永久消失
     bl['star3'] = list(derived['star3'])
     bl['star2'] = list(derived['star2'])
@@ -341,7 +435,9 @@ async def update_pool(force=False) -> int:
         hoshino.logger.exception(f'从库快照推导卡池失败: {repr(e)}')
         return -2
 
-    hoshino.logger.info(f"库快照{os.path.basename(db_path)}推导出当前UP角色: {'、'.join(derived['up'])} (gacha_id={derived['gacha_id']})")
+    hoshino.logger.info(
+        f"库快照{os.path.basename(db_path)}推导出当前卡池: {derived.get('banner_name')}"
+        f"(gacha_id={derived['gacha_id']}) UP: {'、'.join(derived['up'])}")
 
     # 比较本地版本号
     local_ver = get_local_ver()
@@ -371,6 +467,7 @@ async def update_pool(force=False) -> int:
         need_rewrite = (
             set(local_pool_now.keys()) != {'BL', 'FES'}
             or local_bl.get('up') != bl_up
+            or local_bl.get('s3_prob') != derived.get('s3_prob')
             or (derived.get('gacha_id') is not None
                 and str(local_bl.get('banner_id')) != str(derived.get('gacha_id')))
             or local_bl.get('star3') != bl_star3
